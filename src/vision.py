@@ -19,7 +19,7 @@ class Vision:
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
         detector_parameters = cv2.aruco.DetectorParameters()
-        detector_parameters.detectInvertedMarker = True
+        detector_parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_APRILTAG
         self.tag_detector = cv2.aruco.ArucoDetector(
             cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_16h5),
             detector_parameters
