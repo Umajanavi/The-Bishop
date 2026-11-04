@@ -80,7 +80,7 @@ class Vision:
         return rotation_vector_to_pose(rotation_vector, translation_vector)
 
     def _detect_pieces(self, frame, clean_frame, surface_to_camera):
-        boxes = self.piece_detector.predict(frame, verbose=False)[0].obb.xywhr.cpu().numpy()
+        boxes = self.piece_detector.predict(clean_frame, verbose=False)[0].obb.xywhr.cpu().numpy()
         poses = [self._get_piece_pose(box, surface_to_camera) for box in boxes]
         boxes, poses = self._remove_false_positives(boxes, poses)
         if not boxes:
