@@ -71,7 +71,15 @@ def get_state(old_board, is_setup=False):
             canvas.set_frame(state.frame)
             canvas.set_commands([])
             canvas.draw()
-        elif not is_setup and not is_move_legal(old_board, state.board):
+        elif is_setup:
+            return state
+        else:
+            move = find_legal_move(old_board, state.board)
+            if move is not None:
+                game_board = old_board.copy()
+                game_board.push(move)
+                return state._replace(board=game_board)
+
             canvas.set_text("Illegal move")
             canvas.set_detected_board(state.board)
             canvas.set_frame(state.frame)
@@ -79,8 +87,6 @@ def get_state(old_board, is_setup=False):
             canvas.draw()
             if canvas.wait_for_command() == result_cmd:
                 return None
-        else:
-            return state
 
 def set_board(state, target_board, title):
     canvas.set_text(f"{title} - planning")
@@ -133,7 +139,6 @@ def take_turns(state):
         if state is None:
             return
 
-        state.board.turn = chess.WHITE
         if is_game_over(state.board):
             break
 

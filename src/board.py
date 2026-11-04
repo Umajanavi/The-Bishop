@@ -5,16 +5,16 @@ def is_game_over(board: chess.Board):
     return board.is_game_over() or board.can_claim_draw()
 
 
-def is_move_legal(board_before: chess.Board, board_after: chess.Board):
+def find_legal_move(board_before: chess.Board, board_after: chess.Board):
     for move in board_before.legal_moves:
         board_before.push(move)
         matches = board_before.board_fen() == board_after.board_fen()
         board_before.pop()
 
         if matches:
-            return True
+            return move
 
-    return False
+    return None
 
 
 def diff_board(board: chess.Board, target_board: chess.Board):
