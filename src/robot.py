@@ -17,6 +17,14 @@ class Robot(ABC):
     def open_gripper(self):
         self._retry(self._open_gripper)
 
+    def get_joints(self):
+        # Optional: the arm's joint angles, or None if this robot can't report them.
+        # Without them the joint-limit protection in the motion planner stays off.
+        return None
+
+    def move_to_joints(self, joints):
+        raise NotImplementedError
+
     def quit(self):
         pass
 
