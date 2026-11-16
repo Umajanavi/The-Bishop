@@ -36,7 +36,9 @@ STALL_IGNORE_BELOW_M = 0.005        # the last few millimetres of a move are slo
 BLOCKED_TIMEOUT_S = 1.0             # a joint limit may hold the move back this long before it is stopped
 MODEL_TOLERANCE_M = 0.004           # the kinematic model must agree with the robot's own pose this well
 MODEL_TOLERANCE_RAD = 0.03
-CONTACT_ZONE_M = 0.008              # touchdown is only recognised this close to the target (e.g. the table surface)
+CONTACT_ZONE_M = 0.0035             # a hand that stops moving is only called "touchdown" this close to the target (the table
+                                    # is at most a few mm below a place target; further up it may just be sliding onto a piece)
+REFLEX_CONTACT_ZONE_M = 0.008       # a contact reflex this close to the target is also accepted as having arrived
 CONTACT_WINDOW_S = 0.4              # the hand must have been commanded to move over this long ...
 CONTACT_MIN_COMMANDED_M = 0.0012    # ... by at least this far in total ...
 CONTACT_MOVED_FRACTION = 0.25       # ... yet moved less than this fraction of it
@@ -117,7 +119,7 @@ class FrankaEmika(Robot):
 
                 if commands_sent:
                     reason = self._robot_error_reason()
-                    if reason != NO_ERROR_DETAILS and distance < CONTACT_ZONE_M:
+                    if reason != NO_ERROR_DETAILS and distance < REFLEX_CONTACT_ZONE_M:
                         if DEBUG_SERVO:
                             print(f"[servo] the robot's contact detection tripped {distance * 1000:.1f} mm from the target "
                                   f"({reason}); treated as touchdown")
@@ -197,7 +199,7 @@ class FrankaEmika(Robot):
                     try:
                         self._arm.move(fk.JointVelocityMotion(velocity.astype(float)), asynchronous=True)
                     except Exception as error:
-                        if distance < CONTACT_ZONE_M:
+                        if distance < REFLEX_CONTACT_ZONE_M:
                             if DEBUG_SERVO:
                                 print(f"[servo] the robot refused a command {distance * 1000:.1f} mm from the target "
                                       f"({self._robot_error_reason()}); treated as touchdown")
