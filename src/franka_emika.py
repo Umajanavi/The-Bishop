@@ -36,6 +36,7 @@ STALL_IGNORE_BELOW_M = 0.005        # the last few millimetres of a move are slo
 BLOCKED_TIMEOUT_S = 1.0             # a joint limit may hold the move back this long before it is stopped
 MODEL_TOLERANCE_M = 0.004           # the kinematic model must agree with the robot's own pose this well
 MODEL_TOLERANCE_RAD = 0.03
+NO_ERROR_DETAILS = "no error details available"
 
 
 class FrankaEmika(Robot):
@@ -98,6 +99,15 @@ class FrankaEmika(Robot):
                 position_error = target[:3, 3] - hand[:3, 3]
                 rotation_error = Rotation.from_matrix(target[:3, :3] @ hand[:3, :3].T).as_rotvec()
                 distance, angle = np.linalg.norm(position_error), np.linalg.norm(rotation_error)
+
+                if commands_sent:
+                    reason = self._robot_error_reason()
+                    if reason != NO_ERROR_DETAILS:
+                        raise RuntimeError(
+                            f"The robot stopped itself ({reason}) after {now - began:.1f} s, with {distance * 1000:.1f} mm "
+                            f"and {np.degrees(angle):.1f} degrees still to go. Hand at z = {hand[2, 3] * 1000:.1f} mm, "
+                            f"target z = {target[2, 3] * 1000:.1f} mm (robot base frame). "
+                            "A cartesian_reflex is the robot's contact detection: the hand pressed on something.")
 
                 if DEBUG_SERVO and not announced:
                     announced = True
@@ -184,8 +194,8 @@ class FrankaEmika(Robot):
         try:
             self._arm.move(fk.JointVelocityStopMotion())
         except Exception as error:
-            if "User stopped" in str(error):
-                return
+            if "User stopped" in str(error) or "Reflex" in str(error):
+                return                  # already stopped (by the user or by the robot's own reflex)
             try:
                 self._arm.move(fk.JointVelocityMotion(np.zeros(7)), asynchronous=True)
                 self._arm.join_motion()
@@ -209,7 +219,7 @@ class FrankaEmika(Robot):
                         found.append(f"{attribute}: {value}")
                 except Exception:
                     pass
-        return "; ".join(found) or "no error details available"
+        return "; ".join(found) or NO_ERROR_DETAILS
 
     def _read_joints(self):
         return np.array(self._arm.current_joint_state.position, dtype=float)
