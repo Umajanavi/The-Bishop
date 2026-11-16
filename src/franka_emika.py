@@ -181,6 +181,25 @@ class FrankaEmika(Robot):
                 self._arm.join_motion()
             except Exception as second_error:
                 print(f"Warning: could not stop the arm cleanly: {error} / {second_error}")
+                print(f"[servo] why the robot is in reflex: {self._robot_error_reason()}")
+
+    def _robot_error_reason(self):
+        """Ask franky/libfranka which errors the robot reports (best effort, for the console only)."""
+        found = []
+        for owner_name in ("_arm", "state"):
+            try:
+                owner = self._arm if owner_name == "_arm" else self._arm.state
+            except Exception:
+                continue
+            for attribute in ("current_errors", "last_motion_errors"):
+                try:
+                    value = getattr(owner, attribute)
+                    value = value() if callable(value) else value
+                    if str(value) not in ("", "[]", "None"):
+                        found.append(f"{attribute}: {value}")
+                except Exception:
+                    pass
+        return "; ".join(found) or "no error details available"
 
     def _read_joints(self):
         return np.array(self._arm.current_joint_state.position, dtype=float)
