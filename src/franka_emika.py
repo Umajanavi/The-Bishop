@@ -19,6 +19,8 @@ POSITION_GAIN = 3.5                 # 1/s: wanted hand speed per metre still to 
 LATERAL_GAIN = 6.0                  # 1/s: pulls the hand back onto the straight path to the target
 ROTATION_GAIN = 2.0                 # 1/s: wanted turning speed per radian of orientation error
 MAX_LINEAR_SPEED_M_S = 0.10
+SOFT_LANDING_BASE_M_S = 0.010       # speed limit near the target is this plus ...
+SOFT_LANDING_GAIN = 1.0             # ... this (1/s) times the distance still to go
 MAX_ANGULAR_SPEED_RAD_S = 0.35
 MAX_JOINT_SPEED_RAD_S = 0.20        # franky clips joints at 0.26 rad/s at the 0.1 dynamics factor used here
 RAMP_UP_S = 1.0                     # speed builds up over this time at the start of a move
@@ -136,7 +138,10 @@ class FrankaEmika(Robot):
                     wanted = path * along + sideways * LATERAL_GAIN
 
                 ramp = 1.0 if MOVE_MODE == "dry_run" else min(1.0, (now - began) / RAMP_UP_S)
-                linear = _limited(wanted, MAX_LINEAR_SPEED_M_S) * ramp
+                # Soft landing: the closer to the target, the slower, so a light touch of a piece or the board
+                # at the end of a descent doesn't trip the robot's contact detection.
+                landing_speed = SOFT_LANDING_BASE_M_S + SOFT_LANDING_GAIN * distance
+                linear = _limited(wanted, min(MAX_LINEAR_SPEED_M_S, landing_speed)) * ramp
                 angular = _limited(rotation_error * ROTATION_GAIN, MAX_ANGULAR_SPEED_RAD_S) * ramp
 
                 velocity, note, blocked = joint_velocity_command(
@@ -157,7 +162,12 @@ class FrankaEmika(Robot):
                     return
 
                 if np.max(np.abs(velocity - last_velocity)) >= MIN_COMMAND_CHANGE_RAD_S or now - last_sent >= SERVO_REFRESH_S:
-                    self._arm.move(fk.JointVelocityMotion(velocity.astype(float)), asynchronous=True)
+                    try:
+                        self._arm.move(fk.JointVelocityMotion(velocity.astype(float)), asynchronous=True)
+                    except Exception as error:
+                        raise RuntimeError(
+                            f"The robot stopped itself ({self._robot_error_reason()}) with {distance * 1000:.1f} mm "
+                            f"and {np.degrees(angle):.1f} degrees still to go: {error}") from error
                     last_velocity, last_sent = velocity, now
                     commands_sent += 1
 
