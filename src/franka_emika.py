@@ -1,14 +1,47 @@
+import time
 import numpy as np
 import franky as fk
 from scipy.spatial.transform import Rotation
 from src.robot import Robot
+from src.safety import joint_margins, joint_velocity_command, panda_fk
 from src.transforms import *
+
+# "servo":     move the hand the way the face follower does, with joint velocities and the joint-limit
+#              logic in src/safety.py (null-space pull, slowing near limits, hard margin).
+# "cartesian": the original franky Cartesian move, with no joint-limit logic.
+# "dry_run":   reads the robot and prints what the servo move would do, but never moves the arm.
+MOVE_MODE = "servo"
+DEBUG_SERVO = True                  # print one line at the start and end of every servo move
+
+SERVO_INTERVAL_S = 0.05             # how often the loop runs and sends a velocity command
+SERVO_REFRESH_S = 0.4               # an unchanged command is re-sent at least this often
+POSITION_GAIN = 3.5                 # 1/s: wanted hand speed per metre still to go along the path
+LATERAL_GAIN = 6.0                  # 1/s: pulls the hand back onto the straight path to the target
+ROTATION_GAIN = 2.0                 # 1/s: wanted turning speed per radian of orientation error
+MAX_LINEAR_SPEED_M_S = 0.10
+MAX_ANGULAR_SPEED_RAD_S = 0.35
+MAX_JOINT_SPEED_RAD_S = 0.20        # franky clips joints at 0.26 rad/s at the 0.1 dynamics factor used here
+RAMP_UP_S = 1.0                     # speed builds up over this time at the start of a move
+POSITION_TOLERANCE_M = 0.001        # the real arm creeps about 0.5 mm between moves even at rest, so 1 mm is as exact as it gets
+ROTATION_TOLERANCE_RAD = 0.015
+CLOSE_ENOUGH_M = 0.003              # if the arm cannot get closer than this and has stopped improving, the move counts as done
+CLOSE_ENOUGH_RAD = 0.05
+MIN_COMMAND_CHANGE_RAD_S = 0.0005   # the corrections near the target are tiny but must still be sent
+MOVE_TIMEOUT_S = 40.0
+STALL_WINDOW_S = 2.0                # every this many seconds the arm must have got at least ...
+STALL_MIN_PROGRESS_M = 0.004        # ... this much closer (2 mm/s). A joint limit slows the arm to a crawl, never to a halt.
+STALL_IGNORE_BELOW_M = 0.005        # the last few millimetres of a move are slow by design
+BLOCKED_TIMEOUT_S = 1.0             # a joint limit may hold the move back this long before it is stopped
+MODEL_TOLERANCE_M = 0.004           # the kinematic model must agree with the robot's own pose this well
+MODEL_TOLERANCE_RAD = 0.03
+
 
 class FrankaEmika(Robot):
     def __init__(self, wait_for_retry, ip="172.16.0.2"):
         super().__init__(wait_for_retry)
         self._arm = fk.Robot(ip)
         self._gripper = fk.Gripper(ip)
+        self._flange_to_hand = None
 
         self._arm.recover_from_errors()
         self._arm.relative_dynamics_factor = 0.1
@@ -19,25 +52,160 @@ class FrankaEmika(Robot):
         return fix_rotation_error(pose * 1000)
 
     def _move_to(self, pose):
+        if MOVE_MODE in ("servo", "dry_run"):
+            self._servo_to(pose)
+        else:
+            self._cartesian_to(pose)
+
+    def _cartesian_to(self, pose):
         self._arm.stop()
         self._arm.recover_from_errors()
         quat = Rotation.from_matrix(pose[:3, :3]).as_quat()
         motion = fk.CartesianMotion(fk.Affine(pose[:3, 3] * 0.001, quat), reference_type=fk.ReferenceType.Absolute)
         self._arm.move(motion)
 
-    def get_joints(self):
-        # Only called while the viewing pose is being set, never between the moves of a game:
-        # on this arm, reading the state right before a long Cartesian move made that move abort.
-        try:
-            return np.array(self._arm.current_joint_state.position, dtype=float)
-        except Exception as error:
-            print(f"Couldn't read the joint angles, joint-limit protection is off: {error}")
-            return None
+    def _servo_to(self, pose):
+        target = np.array(pose, dtype=float)
+        target[:3, 3] *= 0.001
 
-    def move_to_joints(self, joints):
         self._arm.stop()
         self._arm.recover_from_errors()
-        self._arm.move(fk.JointMotion(np.asarray(joints, dtype=float).tolist()))
+        self._learn_hand_offset()
+
+        began = last_sent = time.time()
+        last_velocity = np.zeros(7)
+        blocked_since = None
+        start = path = None
+        checkpoint_progress, checkpoint_time, note = None, began, ""
+        commands_sent = 0
+        announced = False
+
+        try:
+            while True:
+                now = time.time()
+                joints = self._read_joints()
+                hand = self._read_hand_pose()
+                self._check_model(joints, hand)
+
+                if start is None:
+                    start = hand[:3, 3].copy()
+                    path = target[:3, 3] - start
+                    length = float(np.linalg.norm(path))
+                    path = path / length if length > 1e-6 else None
+
+                position_error = target[:3, 3] - hand[:3, 3]
+                rotation_error = Rotation.from_matrix(target[:3, :3] @ hand[:3, :3].T).as_rotvec()
+                distance, angle = np.linalg.norm(position_error), np.linalg.norm(rotation_error)
+
+                if DEBUG_SERVO and not announced:
+                    announced = True
+                    print(f"[servo] start: {distance * 1000:.1f} mm and {np.degrees(angle):.1f} deg to go | "
+                          f"joint margins {np.round(joint_margins(joints), 2).tolist()}")
+
+                if distance < POSITION_TOLERANCE_M and angle < ROTATION_TOLERANCE_RAD:
+                    break
+                if now - began > MOVE_TIMEOUT_S:
+                    if distance < CLOSE_ENOUGH_M and angle < CLOSE_ENOUGH_RAD:
+                        break
+                    raise RuntimeError(
+                        f"The arm did not reach its target in {MOVE_TIMEOUT_S:.0f} s "
+                        f"(still {distance * 1000:.1f} mm and {np.degrees(angle):.1f} degrees away)")
+
+                # Stalled: a joint limit can slow the arm to a crawl without ever blocking it outright.
+                progress = distance + 0.05 * angle
+                if checkpoint_progress is None:
+                    checkpoint_progress, checkpoint_time = progress, now
+                elif now - checkpoint_time >= STALL_WINDOW_S:
+                    if distance < CLOSE_ENOUGH_M and angle < CLOSE_ENOUGH_RAD and checkpoint_progress - progress < POSITION_TOLERANCE_M:
+                        break
+                    if checkpoint_progress - progress < STALL_MIN_PROGRESS_M and progress > STALL_IGNORE_BELOW_M:
+                        raise RuntimeError(
+                            f"The arm is barely moving ({note.replace('SLOWED: ', '') or 'no joint limit reported'}), "
+                            f"still {distance * 1000:.1f} mm and {np.degrees(angle):.1f} degrees from its target. "
+                            f"Joint margins: {np.round(joint_margins(joints), 2).tolist()}")
+                    checkpoint_progress, checkpoint_time = progress, now
+
+                # Follow the straight line from where the move started to the target: speed along it, and a
+                # stronger pull back onto it, so the hand carrying a piece doesn't wander off the path.
+                if path is None:
+                    wanted = position_error * POSITION_GAIN
+                else:
+                    progress_along = float(np.dot(hand[:3, 3] - start, path))
+                    along = np.clip((length - progress_along) * POSITION_GAIN, -MAX_LINEAR_SPEED_M_S, MAX_LINEAR_SPEED_M_S)
+                    sideways = (start + progress_along * path) - hand[:3, 3]
+                    wanted = path * along + sideways * LATERAL_GAIN
+
+                ramp = 1.0 if MOVE_MODE == "dry_run" else min(1.0, (now - began) / RAMP_UP_S)
+                linear = _limited(wanted, MAX_LINEAR_SPEED_M_S) * ramp
+                angular = _limited(rotation_error * ROTATION_GAIN, MAX_ANGULAR_SPEED_RAD_S) * ramp
+
+                velocity, note, blocked = joint_velocity_command(
+                    joints, np.concatenate([linear, angular]), max_speed=MAX_JOINT_SPEED_RAD_S)
+
+                if blocked:
+                    blocked_since = blocked_since or now
+                    if now - blocked_since > BLOCKED_TIMEOUT_S:
+                        raise RuntimeError(
+                            (note.replace("SLOWED: ", "") or "a joint limit") + " - this move is not possible from here. "
+                            f"Joint margins: {np.round(joint_margins(joints), 2).tolist()}")
+                else:
+                    blocked_since = None
+
+                if MOVE_MODE == "dry_run":
+                    print(f"[servo dry run] would send joint velocities {np.round(velocity, 3).tolist()} rad/s "
+                          f"(largest {np.max(np.abs(velocity)):.3f}) {note}; the arm is not moved")
+                    return
+
+                if np.max(np.abs(velocity - last_velocity)) >= MIN_COMMAND_CHANGE_RAD_S or now - last_sent >= SERVO_REFRESH_S:
+                    self._arm.move(fk.JointVelocityMotion(velocity.astype(float)), asynchronous=True)
+                    last_velocity, last_sent = velocity, now
+                    commands_sent += 1
+
+                time.sleep(SERVO_INTERVAL_S)
+        finally:
+            # Only stop a motion that was started. Stopping a robot that is already at rest would
+            # start a new velocity-control session for nothing.
+            if commands_sent:
+                self._stop_servo()
+            if DEBUG_SERVO:
+                print(f"[servo] done after {time.time() - began:.1f} s, {commands_sent} velocity commands")
+
+    def _stop_servo(self):
+        try:
+            self._arm.move(fk.JointVelocityStopMotion())
+        except Exception as error:
+            if "User stopped" in str(error):
+                return
+            try:
+                self._arm.move(fk.JointVelocityMotion(np.zeros(7)), asynchronous=True)
+                self._arm.join_motion()
+            except Exception as second_error:
+                print(f"Warning: could not stop the arm cleanly: {error} / {second_error}")
+
+    def _read_joints(self):
+        return np.array(self._arm.current_joint_state.position, dtype=float)
+
+    def _read_hand_pose(self):
+        return np.array(self._arm.current_cartesian_state.pose.end_effector_pose.matrix, dtype=float)
+
+    def _learn_hand_offset(self):
+        """
+        The robot reports the pose of its hand (end effector). The kinematic model works on the
+        flange, so the fixed transform between the two is read from the robot once, which also
+        covers whatever gripper and end-effector setup is configured in Desk.
+        """
+        if self._flange_to_hand is None:
+            self._flange_to_hand = np.linalg.inv(panda_fk(self._read_joints())) @ self._read_hand_pose()
+
+    def _check_model(self, joints, hand):
+        """The joint-limit logic is only as good as the kinematic model: stop if it disagrees with the robot."""
+        model = panda_fk(joints) @ self._flange_to_hand
+        offset = np.linalg.norm(model[:3, 3] - hand[:3, 3])
+        turn = np.linalg.norm(Rotation.from_matrix(model[:3, :3] @ hand[:3, :3].T).as_rotvec())
+        if offset > MODEL_TOLERANCE_M or turn > MODEL_TOLERANCE_RAD:
+            raise RuntimeError(
+                f"The kinematic model is {offset * 1000:.1f} mm and {np.degrees(turn):.1f} degrees off the robot's own pose. "
+                "Set MOVE_MODE = \"cartesian\" in src/franka_emika.py to use the original move.")
 
     def _close_gripper(self):
         self._arm.recover_from_errors()
@@ -46,3 +214,8 @@ class FrankaEmika(Robot):
     def _open_gripper(self):
         self._arm.recover_from_errors()
         self._gripper.move(0.02, 0.02)
+
+
+def _limited(vector, maximum):
+    length = np.linalg.norm(vector)
+    return vector if length <= maximum else vector * (maximum / length)
