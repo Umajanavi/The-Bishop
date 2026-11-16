@@ -51,6 +51,7 @@ class FrankaEmika(Robot):
         self._arm = fk.Robot(ip)
         self._gripper = fk.Gripper(ip)
         self._flange_to_hand = None
+        self._holding_piece = False      # True between closing and opening the gripper
 
         self._arm.recover_from_errors()
         self._arm.relative_dynamics_factor = 0.1
@@ -112,17 +113,13 @@ class FrankaEmika(Robot):
                 if (distance < CONTACT_ZONE_M and distance > POSITION_TOLERANCE_M and angle < CLOSE_ENOUGH_RAD
                         and now - began > RAMP_UP_S + 0.5
                         and self._touched_down(history, hand[:3, 3], now)):
-                    if DEBUG_SERVO:
-                        print(f"[servo] touchdown: the hand stopped {distance * 1000:.1f} mm short of the target "
-                              f"(resting on something), so the move ends here")
+                    self._contact_at_target(distance, hand, target, "the hand stopped moving")
                     break
 
                 if commands_sent:
                     reason = self._robot_error_reason()
                     if reason != NO_ERROR_DETAILS and distance < REFLEX_CONTACT_ZONE_M:
-                        if DEBUG_SERVO:
-                            print(f"[servo] the robot's contact detection tripped {distance * 1000:.1f} mm from the target "
-                                  f"({reason}); treated as touchdown")
+                        self._contact_at_target(distance, hand, target, f"the robot's contact detection tripped ({reason})")
                         break
                     if reason != NO_ERROR_DETAILS:
                         raise RuntimeError(
@@ -200,9 +197,7 @@ class FrankaEmika(Robot):
                         self._arm.move(fk.JointVelocityMotion(velocity.astype(float)), asynchronous=True)
                     except Exception as error:
                         if distance < REFLEX_CONTACT_ZONE_M:
-                            if DEBUG_SERVO:
-                                print(f"[servo] the robot refused a command {distance * 1000:.1f} mm from the target "
-                                      f"({self._robot_error_reason()}); treated as touchdown")
+                            self._contact_at_target(distance, hand, target, f"the robot refused a command ({self._robot_error_reason()})")
                             break
                         raise RuntimeError(
                             f"The robot stopped itself ({self._robot_error_reason()}) with {distance * 1000:.1f} mm "
@@ -218,6 +213,22 @@ class FrankaEmika(Robot):
                 self._stop_servo()
             if DEBUG_SERVO:
                 print(f"[servo] done after {time.time() - began:.1f} s, {commands_sent} velocity commands")
+
+    def _contact_at_target(self, distance, hand, target, what):
+        """
+        The hand met something just short of its target. With a piece in the gripper that is the table
+        at the end of a place move, which is fine. With an open gripper it is the top of a piece: the
+        fingers are not around it, so closing now would grip air. That must not pass silently.
+        """
+        if self._holding_piece:
+            if DEBUG_SERVO:
+                print(f"[servo] touchdown {distance * 1000:.1f} mm short of the target ({what}); with a piece held "
+                      f"that is the table, so the move ends here")
+            return
+        raise RuntimeError(
+            f"The gripper landed on top of the piece instead of around it: {what}, {distance * 1000:.1f} mm above the "
+            f"grip height (hand z = {hand[2, 3] * 1000:.1f} mm, target z = {target[2, 3] * 1000:.1f} mm). "
+            "The fingers are not centred on the piece, so the grasp was not attempted.")
 
     @staticmethod
     def _touched_down(history, position, now):
@@ -289,10 +300,12 @@ class FrankaEmika(Robot):
     def _close_gripper(self):
         self._arm.recover_from_errors()
         self._gripper.grasp(0.015, 0.02, 20.0)
+        self._holding_piece = True
 
     def _open_gripper(self):
         self._arm.recover_from_errors()
         self._gripper.move(0.02, 0.02)
+        self._holding_piece = False
 
 
 def _limited(vector, maximum):
