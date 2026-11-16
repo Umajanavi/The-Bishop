@@ -36,7 +36,11 @@ STALL_IGNORE_BELOW_M = 0.005        # the last few millimetres of a move are slo
 BLOCKED_TIMEOUT_S = 1.0             # a joint limit may hold the move back this long before it is stopped
 MODEL_TOLERANCE_M = 0.004           # the kinematic model must agree with the robot's own pose this well
 MODEL_TOLERANCE_RAD = 0.03
-NO_ERROR_DETAILS = "no error details available"
+CONTACT_ZONE_M = 0.008              # touchdown is only recognised this close to the target (e.g. the table surface)
+CONTACT_WINDOW_S = 0.4              # the hand must have been commanded to move over this long ...
+CONTACT_MIN_COMMANDED_M = 0.0012    # ... by at least this far in total ...
+CONTACT_MOVED_FRACTION = 0.25       # ... yet moved less than this fraction of it
+NO_ERROR_DETAILS ="no error details available"
 
 
 class FrankaEmika(Robot):
@@ -82,6 +86,7 @@ class FrankaEmika(Robot):
         checkpoint_progress, checkpoint_time, note = None, began, ""
         commands_sent = 0
         announced = False
+        history = []                     # (time, hand position, commanded linear speed) of the last cycles
 
         try:
             while True:
@@ -100,8 +105,23 @@ class FrankaEmika(Robot):
                 rotation_error = Rotation.from_matrix(target[:3, :3] @ hand[:3, :3].T).as_rotvec()
                 distance, angle = np.linalg.norm(position_error), np.linalg.norm(rotation_error)
 
+                # Touchdown: close to the target, commanded to move, but the hand is no longer moving. The
+                # hand is resting on the board or a piece, so stop pushing instead of building up force.
+                if (distance < CONTACT_ZONE_M and distance > POSITION_TOLERANCE_M and angle < CLOSE_ENOUGH_RAD
+                        and now - began > RAMP_UP_S + 0.5
+                        and self._touched_down(history, hand[:3, 3], now)):
+                    if DEBUG_SERVO:
+                        print(f"[servo] touchdown: the hand stopped {distance * 1000:.1f} mm short of the target "
+                              f"(resting on something), so the move ends here")
+                    break
+
                 if commands_sent:
                     reason = self._robot_error_reason()
+                    if reason != NO_ERROR_DETAILS and distance < CONTACT_ZONE_M:
+                        if DEBUG_SERVO:
+                            print(f"[servo] the robot's contact detection tripped {distance * 1000:.1f} mm from the target "
+                                  f"({reason}); treated as touchdown")
+                        break
                     if reason != NO_ERROR_DETAILS:
                         raise RuntimeError(
                             f"The robot stopped itself ({reason}) after {now - began:.1f} s, with {distance * 1000:.1f} mm "
@@ -153,6 +173,8 @@ class FrankaEmika(Robot):
                 landing_speed = SOFT_LANDING_BASE_M_S + SOFT_LANDING_GAIN * distance
                 linear = _limited(wanted, min(MAX_LINEAR_SPEED_M_S, landing_speed)) * ramp
                 angular = _limited(rotation_error * ROTATION_GAIN, MAX_ANGULAR_SPEED_RAD_S) * ramp
+                history.append((now, hand[:3, 3].copy(), float(np.linalg.norm(linear))))
+                del history[:-12]
 
                 velocity, note, blocked = joint_velocity_command(
                     joints, np.concatenate([linear, angular]), max_speed=MAX_JOINT_SPEED_RAD_S)
@@ -175,6 +197,11 @@ class FrankaEmika(Robot):
                     try:
                         self._arm.move(fk.JointVelocityMotion(velocity.astype(float)), asynchronous=True)
                     except Exception as error:
+                        if distance < CONTACT_ZONE_M:
+                            if DEBUG_SERVO:
+                                print(f"[servo] the robot refused a command {distance * 1000:.1f} mm from the target "
+                                      f"({self._robot_error_reason()}); treated as touchdown")
+                            break
                         raise RuntimeError(
                             f"The robot stopped itself ({self._robot_error_reason()}) with {distance * 1000:.1f} mm "
                             f"and {np.degrees(angle):.1f} degrees still to go: {error}") from error
@@ -189,6 +216,17 @@ class FrankaEmika(Robot):
                 self._stop_servo()
             if DEBUG_SERVO:
                 print(f"[servo] done after {time.time() - began:.1f} s, {commands_sent} velocity commands")
+
+    @staticmethod
+    def _touched_down(history, position, now):
+        """True if the hand was commanded to move over the last moments but has hardly moved at all."""
+        recent = [entry for entry in history if now - entry[0] <= CONTACT_WINDOW_S]
+        if len(recent) < 2 or now - recent[0][0] < CONTACT_WINDOW_S * 0.75:
+            return False
+        elapsed = now - recent[0][0]
+        commanded = float(np.mean([entry[2] for entry in recent])) * elapsed
+        moved = float(np.linalg.norm(position - recent[0][1]))
+        return commanded > CONTACT_MIN_COMMANDED_M and moved < CONTACT_MOVED_FRACTION * commanded
 
     def _stop_servo(self):
         try:
