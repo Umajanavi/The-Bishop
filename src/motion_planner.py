@@ -4,7 +4,14 @@ import numpy as np
 from config import *
 from src.board import *
 from src.transforms import *
+from scipy.spatial.transform import Rotation
 from src.types import *
+
+# The board is flat and so is the robot's table, so the board plane should be level in the robot's coordinates. A small
+# error in the hand-eye calibration tilts the measured plane instead: the computed table height is then too low in
+# one part of the board and too high in another, and the gripper hits the table or closes above the piece.
+# True: remove that tilt (the plane is rotated about the board centre until it is level). Off by default.
+LEVEL_SURFACE = False
 
 
 class MotionPlanner:
@@ -51,6 +58,7 @@ class MotionPlanner:
         return None
 
     def make_transfer(self, state, transfer):
+        self._report_surface(state)
         reference_yaw = self._reference_yaw(state)
         pick_pose = self._get_pick_pose(self._snap_pose_yaw(transfer.piece.pose, reference_yaw))
         place_pose = self._get_place_pose(state, transfer.square, reference_yaw)
@@ -122,8 +130,22 @@ class MotionPlanner:
     def _approach(self, pose):
         return move_along_axis(pose, 2, -ROBOT_APPROACH_HEIGHT)
 
+    def _surface_to_base(self, state):
+        surface_to_base = self.camera_to_base @ state.surface_to_camera
+        return level_pose(surface_to_base) if LEVEL_SURFACE else surface_to_base
+
+    def _report_surface(self, state):
+        surface_to_base = self.camera_to_base @ state.surface_to_camera
+        up = surface_to_base[:3, 2] / np.linalg.norm(surface_to_base[:3, 2])
+        tilt = np.degrees(np.arccos(np.clip(abs(up[2]), -1.0, 1.0)))
+        half_x, half_y = np.array(SURFACE_TAG_SPAN, dtype=float) / 2
+        corners = [surface_to_base @ np.array([x, y, 0.0, 1.0]) for x in (-half_x, half_x) for y in (-half_y, half_y)]
+        heights = [round(float(corner[2]), 1) for corner in corners]
+        print(f"[surface] board plane is tilted {tilt:.2f} deg from level; its height in the robot frame at the four "
+              f"corners is {heights} mm (spread {max(heights) - min(heights):.1f} mm); LEVEL_SURFACE = {LEVEL_SURFACE}")
+
     def _move_to(self, state, pose):
-        base_pose = self.camera_to_base @ state.surface_to_camera @ pose
+        base_pose = self._surface_to_base(state) @ pose
         self.configuration = self.configuration._replace(pose=base_pose)
         yield self.configuration
         self.robot.move_to(base_pose)
@@ -137,3 +159,15 @@ class MotionPlanner:
         self.configuration = self.configuration._replace(is_gripper_closed=False)
         yield self.configuration
         self.robot.open_gripper()
+
+
+def level_pose(pose):
+    """Rotate a pose about its own origin so that its z axis is vertical (keeps the heading and the origin)."""
+    z = pose[:3, 2] / np.linalg.norm(pose[:3, 2])
+    up = np.array([0.0, 0.0, 1.0 if z[2] >= 0 else -1.0])
+    axis = np.cross(z, up)
+    sine = np.linalg.norm(axis)
+    if sine < 1e-9:
+        return pose
+    fix = Rotation.from_rotvec(axis / sine * np.arctan2(sine, np.dot(z, up))).as_matrix()
+    return make_pose(fix @ pose[:3, :3], pose[:3, 3])

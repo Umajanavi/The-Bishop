@@ -44,6 +44,11 @@ CONTACT_MIN_COMMANDED_M = 0.0012    # ... by at least this far in total ...
 CONTACT_MOVED_FRACTION = 0.25       # ... yet moved less than this fraction of it
 NO_ERROR_DETAILS = "no error details available"
 
+# How wide the gripper opens before it comes down on a piece. The icon tile that is gripped is about 13-15 mm
+# wide and the pieces stand about 32 mm apart in the parking area, so there is room for roughly 24-30 mm. The
+# original value was 0.02, which leaves only about 3 mm per side.
+GRIPPER_OPEN_WIDTH_M = 0.026
+
 # When the open gripper lands on top of a piece, a retry does not push on the same spot again: it lifts, shifts
 # a little in the hand's x/y plane (the fingers open along y) and comes down again. Offsets in mm, nearest first.
 SEARCH_OFFSETS_MM = [(0, 2), (0, -2), (2, 0), (-2, 0), (0, 4), (0, -4), (4, 0), (-4, 0),
@@ -344,7 +349,7 @@ class FrankaEmika(Robot):
 
     def _open_gripper(self):
         self._arm.recover_from_errors()
-        self._gripper.move(0.02, 0.02)
+        self._gripper.move(GRIPPER_OPEN_WIDTH_M, 0.02)
         self._holding_piece = False
 
 
