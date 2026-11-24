@@ -42,7 +42,18 @@ REFLEX_CONTACT_ZONE_M = 0.008       # a contact reflex this close to the target 
 CONTACT_WINDOW_S = 0.4              # the hand must have been commanded to move over this long ...
 CONTACT_MIN_COMMANDED_M = 0.0012    # ... by at least this far in total ...
 CONTACT_MOVED_FRACTION = 0.25       # ... yet moved less than this fraction of it
-NO_ERROR_DETAILS ="no error details available"
+NO_ERROR_DETAILS = "no error details available"
+
+# When the open gripper lands on top of a piece, a retry does not push on the same spot again: it lifts, shifts
+# a little in the hand's x/y plane (the fingers open along y) and comes down again. Offsets in mm, nearest first.
+SEARCH_OFFSETS_MM = [(0, 2), (0, -2), (2, 0), (-2, 0), (0, 4), (0, -4), (4, 0), (-4, 0),
+                     (3, 3), (-3, -3), (3, -3), (-3, 3), (0, 6), (0, -6)]
+SEARCH_LIFT_MM = 15.0
+LANDING_STALL_ZONE_M = 0.015        # a stalled descent this close to the grip height is a landing on a piece, not a joint limit
+
+
+class LandedOnTop(RuntimeError):
+    """The open gripper came down on top of a piece instead of around it."""
 
 
 class FrankaEmika(Robot):
@@ -52,6 +63,8 @@ class FrankaEmika(Robot):
         self._gripper = fk.Gripper(ip)
         self._flange_to_hand = None
         self._holding_piece = False      # True between closing and opening the gripper
+        self._failed_pose = None         # the pick pose that the gripper landed on top of, while it is being retried
+        self._search_attempt = 0
 
         self._arm.recover_from_errors()
         self._arm.relative_dynamics_factor = 0.1
@@ -63,9 +76,34 @@ class FrankaEmika(Robot):
 
     def _move_to(self, pose):
         if MOVE_MODE in ("servo", "dry_run"):
-            self._servo_to(pose)
+            self._servo_with_search(pose)
         else:
             self._cartesian_to(pose)
+
+    def _servo_with_search(self, pose):
+        retrying = self._failed_pose is not None and _same_pose(self._failed_pose, pose)
+        if not retrying:
+            self._failed_pose, self._search_attempt = None, 0
+            try:
+                self._servo_to(pose)
+            except LandedOnTop:
+                self._failed_pose = np.array(pose, dtype=float)
+                raise
+            return
+
+        # Retry after landing on top of a piece (poses are in mm): lift, shift sideways, come down again.
+        offset = SEARCH_OFFSETS_MM[self._search_attempt % len(SEARCH_OFFSETS_MM)]
+        self._search_attempt += 1
+        shifted = np.array(pose, dtype=float)
+        shifted[:3, 3] += pose[:3, :3] @ np.array([offset[0], offset[1], 0.0])
+        lifted = shifted.copy()
+        lifted[:3, 3] -= pose[:3, 2] * SEARCH_LIFT_MM          # the hand points down along its own z axis
+        if DEBUG_SERVO:
+            print(f"[servo] retry {self._search_attempt}: lift {SEARCH_LIFT_MM:.0f} mm, shift {offset[0]} mm in x and "
+                  f"{offset[1]} mm in y (hand frame), come down again")
+        self._servo_to(lifted)
+        self._servo_to(shifted)
+        self._failed_pose, self._search_attempt = None, 0
 
     def _cartesian_to(self, pose):
         self._arm.stop()
@@ -150,6 +188,8 @@ class FrankaEmika(Robot):
                     if distance < CLOSE_ENOUGH_M and angle < CLOSE_ENOUGH_RAD and checkpoint_progress - progress < POSITION_TOLERANCE_M:
                         break
                     if checkpoint_progress - progress < STALL_MIN_PROGRESS_M and progress > STALL_IGNORE_BELOW_M:
+                        if not self._holding_piece and distance < LANDING_STALL_ZONE_M and angle < CLOSE_ENOUGH_RAD:
+                            self._contact_at_target(distance, hand, target, "the hand stopped moving")
                         raise RuntimeError(
                             f"The arm is barely moving ({note.replace('SLOWED: ', '') or 'no joint limit reported'}), "
                             f"still {distance * 1000:.1f} mm and {np.degrees(angle):.1f} degrees from its target. "
@@ -225,7 +265,7 @@ class FrankaEmika(Robot):
                 print(f"[servo] touchdown {distance * 1000:.1f} mm short of the target ({what}); with a piece held "
                       f"that is the table, so the move ends here")
             return
-        raise RuntimeError(
+        raise LandedOnTop(
             f"The gripper landed on top of the piece instead of around it: {what}, {distance * 1000:.1f} mm above the "
             f"grip height (hand z = {hand[2, 3] * 1000:.1f} mm, target z = {target[2, 3] * 1000:.1f} mm). "
             "The fingers are not centred on the piece, so the grasp was not attempted.")
@@ -306,6 +346,13 @@ class FrankaEmika(Robot):
         self._arm.recover_from_errors()
         self._gripper.move(0.02, 0.02)
         self._holding_piece = False
+
+
+def _same_pose(a, b):
+    """Same target (poses in mm): within 0.5 mm and about 1 degree."""
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    turn = np.linalg.norm(Rotation.from_matrix(a[:3, :3] @ b[:3, :3].T).as_rotvec())
+    return np.linalg.norm(a[:3, 3] - b[:3, 3]) < 0.5 and turn < 0.02
 
 
 def _limited(vector, maximum):
