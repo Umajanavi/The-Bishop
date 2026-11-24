@@ -1,27 +1,21 @@
 import os
-import time
 import chess
 import numpy as np
-from scipy.spatial.transform import Rotation
 from config import *
 from src.board import *
 from src.transforms import *
 from src.types import *
-
-SETTLE_S = 0.3  # let the arm stop moving before the pose is read and the camera frame is taken
 
 
 class MotionPlanner:
     def __init__(self, robot):
         self.robot = robot
         self.viewing_pose = None
-        self.capture_pose = None
         self.camera_to_base = None
         self.configuration = None
 
     def set_viewing_pose(self):
         self.viewing_pose = self.robot.get_pose()
-        self.capture_pose = self.viewing_pose
         self.camera_to_base = self.viewing_pose @ CAMERA_TO_FLANGE
 
     def has_saved_viewing_pose(self):
@@ -35,17 +29,7 @@ class MotionPlanner:
 
     def look_at_board(self):
         self.robot.move_to(self.viewing_pose)
-        time.sleep(SETTLE_S)
-
-        # The arm stops within a tolerance of the viewing pose, not exactly on it. Everything the camera
-        # sees is turned into robot coordinates through the camera pose, so use where the arm really is.
-        self.capture_pose = self.robot.get_pose()
-        self.camera_to_base = self.capture_pose @ CAMERA_TO_FLANGE
-        self.configuration = RobotConfiguration(pose=self.capture_pose, is_gripper_closed=False)
-
-        offset = np.linalg.norm(self.capture_pose[:3, 3] - self.viewing_pose[:3, 3])
-        turn = np.degrees(np.linalg.norm(Rotation.from_matrix(self.capture_pose[:3, :3] @ self.viewing_pose[:3, :3].T).as_rotvec()))
-        print(f"[look] arm is {offset:.2f} mm and {turn:.2f} deg off the viewing pose")
+        self.configuration = RobotConfiguration(pose=self.viewing_pose, is_gripper_closed=False)
 
     def plan_transfer(self, state, target_board):
         surplus, wanted = diff_board(state.board, target_board)
@@ -119,7 +103,7 @@ class MotionPlanner:
         return move_along_axis(pose, 2, ROBOT_GRIP_HEIGHT) @ roll_pitch_yaw_to_pose([0.0, 0.0, 0.0], roll=np.pi)
 
     def _reference_yaw(self, state):
-        reference_pose = np.linalg.inv(state.surface_to_camera) @ np.linalg.inv(self.camera_to_base) @ self.capture_pose
+        reference_pose = np.linalg.inv(state.surface_to_camera) @ np.linalg.inv(self.camera_to_base) @ self.viewing_pose
         return np.arctan2(reference_pose[1, 0], reference_pose[0, 0])
 
     def _snap_pose_yaw(self, pose, reference_yaw):
