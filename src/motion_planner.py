@@ -143,6 +143,10 @@ class MotionPlanner:
         heights = [round(float(corner[2]), 1) for corner in corners]
         print(f"[surface] board plane is tilted {tilt:.2f} deg from level; its height in the robot frame at the four "
               f"corners is {heights} mm (spread {max(heights) - min(heights):.1f} mm); LEVEL_SURFACE = {LEVEL_SURFACE}")
+        if LEVEL_SURFACE:
+            used = self._surface_to_base(state)
+            used_heights = [round(float((used @ np.array([x, y, 0.0, 1.0]))[2]), 1) for x in (-half_x, half_x) for y in (-half_y, half_y)]
+            print(f"[surface] levelled for the moves: corner heights {used_heights} mm (spread {max(used_heights) - min(used_heights):.1f} mm)")
 
     def _move_to(self, state, pose):
         base_pose = self._surface_to_base(state) @ pose
