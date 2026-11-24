@@ -54,6 +54,8 @@ GRIPPER_OPEN_WIDTH_M = 0.026
 SEARCH_OFFSETS_MM = [(0, 2), (0, -2), (2, 0), (-2, 0), (0, 4), (0, -4), (4, 0), (-4, 0),
                      (3, 3), (-3, -3), (3, -3), (-3, 3), (0, 6), (0, -6)]
 SEARCH_LIFT_MM = 15.0
+GRASP_ATTEMPTS = 6                  # how many shifted tries after a grasp that closed on nothing
+MIN_GRASP_WIDTH_M = 0.008           # fingers closed further than this mean there is no piece between them (the tile is ~13-15 mm)
 LANDING_STALL_ZONE_M = 0.015        # a stalled descent this close to the grip height is a landing on a piece, not a joint limit
 
 
@@ -69,6 +71,7 @@ class FrankaEmika(Robot):
         self._flange_to_hand = None
         self._holding_piece = False      # True between closing and opening the gripper
         self._failed_pose = None         # the pick pose that the gripper landed on top of, while it is being retried
+        self._last_move_pose = None      # target of the last completed move: the grip pose when the gripper closes
         self._search_attempt = 0
 
         self._arm.recover_from_errors()
@@ -84,6 +87,7 @@ class FrankaEmika(Robot):
             self._servo_with_search(pose)
         else:
             self._cartesian_to(pose)
+        self._last_move_pose = np.array(pose, dtype=float)
 
     def _servo_with_search(self, pose):
         retrying = self._failed_pose is not None and _same_pose(self._failed_pose, pose)
@@ -99,16 +103,19 @@ class FrankaEmika(Robot):
         # Retry after landing on top of a piece (poses are in mm): lift, shift sideways, come down again.
         offset = SEARCH_OFFSETS_MM[self._search_attempt % len(SEARCH_OFFSETS_MM)]
         self._search_attempt += 1
+        if DEBUG_SERVO:
+            print(f"[servo] retry {self._search_attempt}: lift {SEARCH_LIFT_MM:.0f} mm, shift {offset[0]} mm in x and "
+                  f"{offset[1]} mm in y (hand frame), come down again")
+        self._lift_shift_descend(pose, offset)
+        self._failed_pose, self._search_attempt = None, 0
+
+    def _lift_shift_descend(self, pose, offset):
         shifted = np.array(pose, dtype=float)
         shifted[:3, 3] += pose[:3, :3] @ np.array([offset[0], offset[1], 0.0])
         lifted = shifted.copy()
         lifted[:3, 3] -= pose[:3, 2] * SEARCH_LIFT_MM          # the hand points down along its own z axis
-        if DEBUG_SERVO:
-            print(f"[servo] retry {self._search_attempt}: lift {SEARCH_LIFT_MM:.0f} mm, shift {offset[0]} mm in x and "
-                  f"{offset[1]} mm in y (hand frame), come down again")
         self._servo_to(lifted)
         self._servo_to(shifted)
-        self._failed_pose, self._search_attempt = None, 0
 
     def _cartesian_to(self, pose):
         self._arm.stop()
@@ -344,8 +351,45 @@ class FrankaEmika(Robot):
 
     def _close_gripper(self):
         self._arm.recover_from_errors()
-        self._gripper.grasp(0.015, 0.02, 20.0)
+        grasped = self._grasp()
+
+        # Closed on nothing (the fingers missed the tile): open, lift, shift a little and try again. Without
+        # this check a missed grasp goes unnoticed until the piece is not on its square.
+        attempt = 0
+        while (not grasped and self._last_move_pose is not None and MOVE_MODE != "dry_run"
+               and attempt < min(GRASP_ATTEMPTS, len(SEARCH_OFFSETS_MM))):
+            offset = SEARCH_OFFSETS_MM[attempt]
+            attempt += 1
+            print(f"[grasp] nothing between the fingers: try {attempt} of {GRASP_ATTEMPTS}, lift {SEARCH_LIFT_MM:.0f} mm, "
+                  f"shift {offset[0]} mm in x and {offset[1]} mm in y (hand frame)")
+            self._gripper.move(GRIPPER_OPEN_WIDTH_M, 0.02)
+            try:
+                self._lift_shift_descend(self._last_move_pose, offset)
+            except LandedOnTop:
+                continue
+            grasped = self._grasp()
+
+        if not grasped:
+            self._gripper.move(GRIPPER_OPEN_WIDTH_M, 0.02)
+            raise RuntimeError(
+                "The gripper closed on nothing: no piece between the fingers" +
+                (f", even after {attempt} shifted tries" if attempt else "") + ". The gripper was opened again.")
+        if attempt and DEBUG_SERVO:
+            print(f"[grasp] got the piece after {attempt} shifted tries")
         self._holding_piece = True
+
+    def _grasp(self):
+        """Close on the piece. True if something is between the fingers afterwards."""
+        result = self._gripper.grasp(0.015, 0.02, 20.0)
+        if result is False:
+            return False
+        try:
+            width = float(self._gripper.width)
+        except Exception:
+            return True                  # this franky version offers no width: trust the grasp command
+        if DEBUG_SERVO:
+            print(f"[grasp] fingers closed to {width * 1000:.1f} mm")
+        return width > MIN_GRASP_WIDTH_M
 
     def _open_gripper(self):
         self._arm.recover_from_errors()
