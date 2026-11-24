@@ -11,7 +11,7 @@ from src.types import *
 # error in the hand-eye calibration tilts the measured plane instead: the computed table height is then too low in
 # one part of the board and too high in another, and the gripper hits the table or closes above the piece.
 # True: remove that tilt (the plane is rotated about the board centre until it is level). Off by default.
-LEVEL_SURFACE = False
+LEVEL_SURFACE = True
 
 
 class MotionPlanner:

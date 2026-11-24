@@ -25,6 +25,8 @@ def wait_for_retry(error):
     canvas.wait_for_command()
 
 robot = FrankaEmika(wait_for_retry)
+from record_poses import start_background
+start_background(robot._read_joints)
 planner = MotionPlanner(robot)
 vision = Vision()
 
